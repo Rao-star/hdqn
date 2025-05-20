@@ -127,7 +127,7 @@ def hdqn_learning(
                 intrinsic_reward = agent.get_intrinsic_reward(goal, next_obs)
                 print("intrinsic_reward:", intrinsic_reward)
                 goal_reached = agent.is_goal_reached(goal, next_obs)
-                print("goal:", goal, "goal_reached:", goal_reached)
+
 
                 joint_next_state_goal = np.concatenate([next_state, encoded_goal])
                 agent.ctrl_replay_memory.push(
@@ -146,6 +146,10 @@ def hdqn_learning(
                 total_extrinsic_reward += extrinsic_reward
                 episode_reward += extrinsic_reward
                 current_state = next_state
+
+                if goal_reached:
+                    print(f"Goal {goal} reached! Terminating subtask.")
+                    break
 
 
             # After goal is completed or episode ends

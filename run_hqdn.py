@@ -30,17 +30,17 @@ def main():
 
     exploration_schedule = LinearSchedule(50000, 0.1, 1)
 
+    env = FullyObsWrapper(gym.make("MiniGrid-DoorKey-5x5-v0"))
+
     agent = hDQN(
+        env=env,
         optimizer_spec=optimizer_spec,
         replay_memory_size=REPLAY_MEMORY_SIZE,
         batch_size=BATCH_SIZE,
     )
 
-    # 创建环境，包裹成 FullyObsWrapper 保证环境返回全观察状态
-    env = FullyObsWrapper(gym.make("MiniGrid-Empty-5x5-v0", disable_env_checker=True))
-
     # 训练 agent
-    agent, stats,= hdqn_learning(
+    agent, stats = hdqn_learning(
         env=env,
         agent=agent,
         num_episodes=NUM_EPISODES,
