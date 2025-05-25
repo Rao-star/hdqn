@@ -13,6 +13,7 @@ pip install -r requirements.txt
 ```
 
 ## How to use
-1. Set the parameters in file 'run_hqdn' (Examples are given here for references ) <br>
-**MiniGrid 5x5 DoorKey:** Using RMSprop as optimizer<br>
-**MiniGrid 8x8 DoorKey:** Using AdamW as optimizer<br>
+1. Setting the appropriate parameters in file 'hdqn_mdp.py', especially the network of meta controller and controller
+2. Setting the appropriate parameters and the save path in file 'run_hqdn.py' for different MiniGrid map
+3. Running the file 'run_hdqn.py'
+4. Setting the the name and path of saved model for testing and visualization
