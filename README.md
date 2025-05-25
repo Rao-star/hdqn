@@ -22,3 +22,4 @@ pip install -r requirements.txt
 <p align="center">
     <img width="300" src="resuilts/MiniGrid 8x8 DoorKey/test-ep800.gif">
 </p>
+<p align="center"><img src="resuilts/MiniGrid 8x8 DoorKey/test-ep800.gif"></p>
