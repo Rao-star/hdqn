@@ -19,4 +19,4 @@ pip install -r requirements.txt
 4. Setting the the name and path of saved model for testing and visualization
 
 ## Example
-![Demo](results/MiniGrid_8x8_DoorKey/test-ep800.gif)
+![Demo](results/MiniGrid 8x8 DoorKey/test-ep800.gif)
