@@ -19,4 +19,4 @@ pip install -r requirements.txt
 4. Setting the the name and path of saved model for testing and visualization
 
 ## Example
-<p align="center"><img width="300" src="README-rsrc/visualize-keycorridor.gif"></p>
+<p align="center"><img width="300" src="results/MiniGrid_8x8_DoorKey/test_ep8000.gif"></p>
