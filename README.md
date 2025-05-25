@@ -17,3 +17,8 @@ pip install -r requirements.txt
 2. Setting the appropriate parameters and the save path in file 'run_hqdn.py' for different MiniGrid map
 3. Running the file 'run_hdqn.py'
 4. Setting the the name and path of saved model for testing and visualization
+
+## Example
+<p align="center">
+    <img width="300" src="resuilts/MiniGrid 8x8 DoorKey/test-ep800.gif">
+</p>
