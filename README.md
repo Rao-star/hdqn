@@ -14,7 +14,7 @@ pip install -r requirements.txt
 
 ## How to use
 1. Set the parameters in file 'run_hqdn' (Examples are given here for references ) <br>
-**MiniGrid 5x5 DoorKey:**
+**MiniGrid 5x5 DoorKey:** Using RMSprop as an optimizer<br>
 NUM_EPISODES = 3000<br>
 BATCH_SIZE = 128<br>
 GAMMA = 0.99<br>
