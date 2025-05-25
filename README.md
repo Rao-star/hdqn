@@ -3,4 +3,5 @@ Using H-DQN, train agent to find the key, open the door, and finally reach the e
 
 ## creat virtual enviroment (Using conda)
 conda create -n hdqn-env python=3.8 <br>
-conda activate hdqn-env
+conda activate hdqn-env <br>
+
