@@ -1,36 +1,44 @@
 import matplotlib.pyplot as plt
 import matplotlib.style
-matplotlib.style.use('ggplot')
-import matplotlib.pyplot as plt
-
-import torch.optim as optim
+import torch
 import gymnasium as gym
 from minigrid.wrappers import FullyObsWrapper
-
-from envs.mdp import StochasticMDPEnv
 from agents.hdqn_mdp import hDQN, OptimizerSpec
 from hdqn import hdqn_learning
-from utils.plotting import plot_episode_stats, plot_visited_states
+from utils.plotting import plot_episode_stats
 from utils.schedule import LinearSchedule
+import torch.optim as optim
+matplotlib.style.use('ggplot')
 
 
 def main():
-    NUM_EPISODES = 100
-    BATCH_SIZE = 32
-    GAMMA = 1.0
-    REPLAY_MEMORY_SIZE = 10000
-    LEARNING_RATE = 0.001
-    ALPHA = 0.99
+    NUM_EPISODES = 8000
+    BATCH_SIZE = 256
+    GAMMA = 0.95
+    REPLAY_MEMORY_SIZE = 100000
+    LEARNING_RATE = 0.00025
+    ALPHA = 0.999
     EPS = 0.01
 
+    #  AdamW Optimizer -- used in MiniGrid 8x8 DoorKey mission
     optimizer_spec = OptimizerSpec(
-        constructor=optim.RMSprop,
-        kwargs=dict(lr=LEARNING_RATE, alpha=ALPHA, eps=EPS),
+        constructor=torch.optim.AdamW,
+        kwargs=dict(lr=LEARNING_RATE, betas=(0.9, 0.999), weight_decay=0.01),
     )
 
-    exploration_schedule = LinearSchedule(50000, 0.1, 1)
+    #  RMSprop Optimizer -- used in MiniGrid 5x5 DoorKey mission
+    # optimizer_spec = OptimizerSpec(
+    #     constructor=optim.RMSprop,
+    #     kwargs=dict(lr=LEARNING_RATE, alpha=ALPHA, eps=EPS),
+    # )
 
-    env = FullyObsWrapper(gym.make("MiniGrid-DoorKey-5x5-v0"))
+    meta_schedule = LinearSchedule(
+        schedule_timesteps=3_000_000, initial_p=1.0, final_p=0.05)  # 长衰减期，高探索率
+
+    ctrl_schedule = LinearSchedule(
+        schedule_timesteps=2_500_000, initial_p=1.0, final_p=0.01)  # 短衰减期，低探索率
+
+    env = FullyObsWrapper(gym.make("MiniGrid-DoorKey-8x8-v0"))
 
     agent = hDQN(
         env=env,
@@ -39,34 +47,19 @@ def main():
         batch_size=BATCH_SIZE,
     )
 
-    # 训练 agent
+    # training
     agent, stats = hdqn_learning(
         env=env,
         agent=agent,
         num_episodes=NUM_EPISODES,
-        exploration_schedule=exploration_schedule,
+        meta_schedule=meta_schedule,
+        ctrl_schedule=ctrl_schedule,
         gamma=GAMMA,
     )
 
-    # 绘制训练过程统计图
     plot_episode_stats(stats)
     plt.show()
 
-    # 先注释访问热力图部分，避免报错
-    # plot_visited_states(visits, NUM_EPISODES)
-    # plt.show()
-
-def test_hdqn(agent, env, episodes=10):
-    agent.eval()  # 切换评估模式
-    for ep in range(episodes):
-        state = env.reset()
-        done = False
-        total_reward = 0
-        while not done:
-            action = agent.select_action(state, epsilon=0.0)  # 不随机，greedy选动作
-            state, reward, done, _ = env.step(action.item())
-            total_reward += reward
-        print(f"Test Episode {ep+1}: Reward = {total_reward}")
 
 if __name__ == "__main__":
     main()

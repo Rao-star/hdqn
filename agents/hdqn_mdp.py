@@ -20,37 +20,51 @@ class Variable(autograd.Variable):
             data = data.cuda()
         super(Variable, self).__init__(data, *args, **kwargs)
 
+
 class MetaController(nn.Module):
-    def __init__(self, in_features, out_features=6):
-        """
-        Initialize a Meta-Controller of Hierarchical DQN network for the diecreate mdp experiment
-            in_features: number of features of input.
-            out_features: number of features of output.
-                Ex: goal for meta-controller or action for controller
-        """
+    def __init__(self, in_features=196, out_features=4):  # 方向编码4个
         super(MetaController, self).__init__()
-        self.fc1 = nn.Linear(in_features, 256)
-        self.fc2 = nn.Linear(256, out_features)
+        self.fc1 = nn.Linear(in_features, 512)
+        self.ln1 = nn.LayerNorm(512)
+        self.fc2 = nn.Linear(512, 256)
+        self.ln2 = nn.LayerNorm(256)
+        self.fc3 = nn.Linear(256, out_features)
+
+    # def forward(self, x):
+    #     x = F.relu(self.fc1(x))
+    #     x = F.relu(self.fc2(x))
+    #     return self.fc3(x)
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        return self.fc2(x)
+        x = F.leaky_relu(self.ln1(self.fc1(x)), 0.01)
+        x = F.dropout(x, p=0.1, training=self.training)
+        x = F.leaky_relu(self.ln2(self.fc2(x)), 0.01)
+        x = self.fc3(x)
+        return x
+
+
+
 
 class Controller(nn.Module):
-    def __init__(self, in_features=79, out_features=7):
-        """
-        Initialize a Controller(given goal) of h-DQN for the diecreate mdp experiment
-            in_features: number of features of input.
-            out_features: number of features of output.
-                Ex: goal for meta-controller or action for controller
-        """
+    def __init__(self, in_features=200, out_features=7):  # 输入：网格192+方向4+子目标4   输出：7个可能动作
         super(Controller, self).__init__()
-        self.fc1 = nn.Linear(in_features, 256)
-        self.fc2 = nn.Linear(256, out_features)
+        self.fc1 = nn.Linear(in_features,512)
+        self.ln1 = nn.LayerNorm(512)
+        self.fc2 = nn.Linear(512, 256)
+        self.ln2 = nn.LayerNorm(256)
+        self.fc3 = nn.Linear(256, out_features)
+
+    # def forward(self, x):
+    #     x = F.relu(self.fc1(x))
+    #     x = F.relu(self.fc2(x))
+    #     return self.fc3(x)
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        return self.fc2(x)
+        x = F.leaky_relu(self.ln1(self.fc1(x)), 0.01)
+        x = F.dropout(x, p=0.1, training=self.training)
+        x = F.leaky_relu(self.ln2(self.fc2(x)), 0.01)
+        x = self.fc3(x)
+        return x
 
 """
     OptimizerSpec containing following attributes
@@ -60,28 +74,12 @@ class Controller(nn.Module):
 OptimizerSpec = namedtuple("OptimizerSpec", ["constructor", "kwargs"])
 
 class hDQN():
-    """
-    The Hierarchical-DQN Agent
-    Parameters
-    ----------
-        optimizer_spec: OptimizerSpec
-            Specifying the constructor and kwargs, as well as learning rate schedule
-            for the optimizer
-        num_goal: int
-            The number of goal that agent can choose from
-        num_action: int
-            The number of action that agent can choose from
-        replay_memory_size: int
-            How many memories to store in the replay memory.
-        batch_size: int
-            How many transitions to sample each time experience is replayed.
-    """
     def __init__(self,
                  env,
                  optimizer_spec,
                  num_goal=4,
                  num_action=7,
-                 replay_memory_size=10000,
+                 replay_memory_size=20000,
                  batch_size=128):
         ###############
         # BUILD MODEL #
@@ -91,8 +89,9 @@ class hDQN():
         self.num_action = num_action
         self.batch_size = batch_size
         # Construct meta-controller and controller
-        controller_input_dim = 79 + num_goal  #(75+4 direction)
-        meta_input_dim = 79  # meta-controller 只看环境状态
+        controller_input_dim = 192 + num_goal + 4  #(75+4 direction)
+        meta_input_dim = 192 + 4   # meta-controller 只看环境状态
+
         self.meta_controller = MetaController(in_features=meta_input_dim, out_features=num_goal).type(dtype)
         self.target_meta_controller = MetaController(in_features=meta_input_dim, out_features=num_goal).type(dtype)
         self.controller = Controller(in_features=controller_input_dim, out_features=num_action).type(dtype)
@@ -103,61 +102,79 @@ class hDQN():
         # Construct the replay memory for meta-controller and controller
         self.meta_replay_memory = ReplayMemory(replay_memory_size)
         self.ctrl_replay_memory = ReplayMemory(replay_memory_size)
+
+        self.controller_update_steps = 0
+        self.completed_goals = set()
         self.possible_goals = [0, 1, 2, 3]
 
     def get_agent_position(self):
         return self.env.unwrapped.agent_pos
 
     def near_key(self, agent_pos, obs):
+        grid = self.env.unwrapped.grid
+        width, height = self.env.unwrapped.width, self.env.unwrapped.height
         for dx in [-1, 0, 1]:
             for dy in [-1, 0, 1]:
                 x, y = agent_pos[0] + dx, agent_pos[1] + dy
-                cell = self.env.unwrapped.grid.get(x, y)
-                if cell and cell.type == 'key':
-                    return True
+                if 0 <= x < width and 0 <= y < height:
+                    cell = grid.get(x, y)
+                    if cell and cell.type == 'key':
+                        return True
         return False
 
     def is_door_open(self, obs):
-        for x in range(self.env.unwrapped.width):
-            for y in range(self.env.unwrapped.height):
-                cell = self.env.unwrapped.grid.get(x, y)
-                if cell and cell.type == 'door' and cell.is_open:
-                    return True
+        for obj in self.env.unwrapped.grid.grid:
+            if obj and obj.type == 'door':
+                return obj.is_open
         return False
 
     def at_goal_tile(self, agent_pos, obs):
         x, y = agent_pos
+        if not (0 <= x < self.env.unwrapped.width and 0 <= y < self.env.unwrapped.height):
+            return False
         cell = self.env.unwrapped.grid.get(x, y)
-        return cell and cell.type == 'goal'
+        return cell is not None and cell.type == 'goal'
 
     def get_intrinsic_reward(self, goal, obs):
-        return 1.0 if self.is_goal_reached(goal, obs) else 0.0
+        if goal == 3 and self.is_goal_reached(goal, obs):
+            return 1.0
+        # elif self.is_goal_reached(goal, obs):
+        #     return 0.2
+        return 0.0
 
-    # def select_goal(self, state, epsilon):
-    #     sample = random.random()
-    #     if sample > epsilon:
-    #         state = torch.from_numpy(state).type(dtype)
-    #         with torch.no_grad():
-    #             q_values = self.meta_controller(state.unsqueeze(0))  # 增加 batch 维度
-    #             goal = q_values.max(1)[1].cpu()
-    #         return goal  # 如果你想返回标量，可以改成 goal.item()
-    #     else:
-    #         return torch.IntTensor([random.randrange(self.num_goal)])
+    def reset_episode_flags(self):
+        self.completed_goals = set()  # 每轮Episode开始时重置
 
     def select_goal(self, state, epsilon):
         sample = random.random()
+        carrying = self.env.unwrapped.carrying
+        door_open = any(obj.is_open for obj in self.env.unwrapped.grid.grid if obj and obj.type == 'door')
+
+        # 动态生成可行目标列表（排除已完成的子目标）
+        active_goals = []
+        if door_open:
+            active_goals = [3]
+        elif carrying and carrying.type == 'key':
+            active_goals = [2]
+        elif any(obj.type == 'key' for obj in self.env.unwrapped.grid.grid if obj):
+            possible_goals = [0, 1]
+            active_goals = [g for g in possible_goals if g not in self.completed_goals]  # 关键修改
+        else:
+            active_goals = []
+
         if sample > epsilon:
+            # 利用阶段：从active_goals中选择Q值最高的目标
             state = torch.from_numpy(state).type(dtype)
             with torch.no_grad():
-                q_values = self.meta_controller(state.unsqueeze(0))  # shape: [1, num_goals]
-                # 只选出可能的目标中的最大 Q 值对应下标
-                possible_q_values = q_values[0][self.possible_goals]  # 选取指定 index 的 q 值
+                q_values = self.meta_controller(state.unsqueeze(0))
+                if not active_goals:
+                    return 3
+                possible_q_values = q_values[0][active_goals]
                 best_idx = torch.argmax(possible_q_values).item()
-                goal = self.possible_goals[best_idx]
-            return goal
+                return active_goals[best_idx]
         else:
-            # 随机从可选目标中选一个
-            return random.choice(self.possible_goals)
+            # 探索阶段：直接排除已完成的子目标
+            return random.choice(active_goals) if active_goals else 3
 
     def select_action(self, joint_state_goal, epsilon):
         sample = random.random()
@@ -166,22 +183,40 @@ class hDQN():
             with torch.no_grad():
                 q_values = self.controller(joint_state_goal.unsqueeze(0))
                 action = q_values.max(1)[1].cpu()
-            return action  # 同理，如需标量可用 action.item()
+            return action
         else:
             return torch.IntTensor([random.randrange(self.num_action)])
 
+    def best_action(self, joint_state_goal):  # 测试时用
+        joint_state_goal = torch.from_numpy(joint_state_goal).type(dtype)
+        with torch.no_grad():
+            q_values = self.controller(joint_state_goal.unsqueeze(0))
+            action = q_values.argmax(1).item()
+        return action
+
+
     def is_goal_reached(self, goal, obs):
         agent_pos = self.get_agent_position()
-        carrying = obs.get("carrying", None)
+        carrying = self.env.unwrapped.carrying
+        grid = self.env.unwrapped.grid
 
-        if goal == 0:  # 走到钥匙附近
-            return self.near_key(agent_pos, obs)
-        elif goal == 1:  # 已拿起钥匙
-            return carrying is not None and carrying['type'] == 'key'
+        if goal == 0:
+            result = (not carrying) and any(obj.type == 'key' for obj in grid.grid if obj) and self.near_key(agent_pos,
+                                                                                                             obs)
+            if result:
+                self.completed_goals.add(0)  # 标记Goal 0已完成
+            return result
+        elif goal == 1:
+            result = carrying is not None and carrying.type == 'key'
+            if result:
+                self.completed_goals.add(1)  # 标记Goal 1已完成
+            return result
         elif goal == 2:  # 门已打开
-            return self.is_door_open(obs)
-        elif goal == 3:  # 到达目标格子
-            return self.at_goal_tile(agent_pos, obs)
+            door = next((obj for obj in grid.grid if obj and obj.type == 'door'), None)
+            return door.is_open if door else False
+        elif goal == 3:  # 到达终点
+            cell = grid.get(agent_pos[0], agent_pos[1])
+            return cell is not None and cell.type == 'goal'
         return False
 
     def update_meta_controller(self, gamma=1.0):
@@ -261,3 +296,7 @@ class hDQN():
         for param in self.controller.parameters():
             param.grad.data.clamp_(-1, 1)
         self.ctrl_optimizer.step()
+
+        # self.controller_update_steps += 1
+        # if self.controller_update_steps % 100 == 0:
+        #     print(f"[Update {self.controller_update_steps}] Controller loss: {loss.item():.4f}")
