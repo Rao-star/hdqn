@@ -13,5 +13,12 @@ pip install -r requirements.txt
 ```
 
 ## How to use
-1. Set the parameters in file 'run_hqdn' 
+1. Set the parameters in file 'run_hqdn' <br>
 **MiniGrid 5x5 DoorKey:**
+NUM_EPISODES = 3000
+BATCH_SIZE = 128
+GAMMA = 0.99
+REPLAY_MEMORY_SIZE = 20000
+LEARNING_RATE = 0.0005
+ALPHA = 0.99
+EPS = 0.01
