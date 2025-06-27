@@ -1,21 +1,34 @@
+import minigrid
 import matplotlib.pyplot as plt
-import matplotlib.style
+import random
+import numpy as np
 import torch
 import gymnasium as gym
-from minigrid.wrappers import FullyObsWrapper
+from minigrid.wrappers import FullyObsWrapper, FlatObsWrapper
 from agents.hdqn_mdp import hDQN, OptimizerSpec
 from hdqn import hdqn_learning
 from utils.plotting import plot_episode_stats
 from utils.schedule import LinearSchedule
+from minigrid.envs.doorkey import DoorKeyEnv
+from gymnasium.envs.registration import register
 import torch.optim as optim
-matplotlib.style.use('ggplot')
 
+
+class DoorKey10x10Env(DoorKeyEnv):
+    def __init__(self, **kwargs):
+        super().__init__(size=10, **kwargs)
+
+register(
+    id='MiniGrid-DoorKey-10x10-v0',
+    entry_point=__name__ + ':DoorKey10x10Env'  # 使用当前模块的类
+)
 
 def main():
-    NUM_EPISODES = 8000
+    NUM_EPISODES = 14_000
     BATCH_SIZE = 256
-    GAMMA = 0.95
-    REPLAY_MEMORY_SIZE = 100000
+    META_GAMMA = 0.99
+    CTLR_GAMMA = 0.99
+    REPLAY_MEMORY_SIZE = 300_000
     LEARNING_RATE = 0.00025
     ALPHA = 0.999
     EPS = 0.01
@@ -33,12 +46,24 @@ def main():
     # )
 
     meta_schedule = LinearSchedule(
-        schedule_timesteps=3_000_000, initial_p=1.0, final_p=0.05)  # 长衰减期，高探索率
+        schedule_timesteps=40_000_000, initial_p=1.0, final_p=0.01)  # longer decay period，higher exploration rate
 
     ctrl_schedule = LinearSchedule(
-        schedule_timesteps=2_500_000, initial_p=1.0, final_p=0.01)  # 短衰减期，低探索率
+        schedule_timesteps=40_000_000, initial_p=1.0, final_p=0.1)  # shorter decay period，lower exploration rate
 
-    env = FullyObsWrapper(gym.make("MiniGrid-DoorKey-8x8-v0"))
+    SEED = 42
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    env = FullyObsWrapper(gym.make("MiniGrid-DoorKey-16x16-v0"))
+    env.reset(seed=SEED)
+    env.action_space.seed(SEED)
+    env.observation_space.seed(SEED)
 
     agent = hDQN(
         env=env,
@@ -54,7 +79,8 @@ def main():
         num_episodes=NUM_EPISODES,
         meta_schedule=meta_schedule,
         ctrl_schedule=ctrl_schedule,
-        gamma=GAMMA,
+        gamma_ctrl= CTLR_GAMMA,
+        gamma_meta= META_GAMMA,
     )
 
     plot_episode_stats(stats)

@@ -2,21 +2,15 @@ import numpy as np
 from collections import defaultdict
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.autograd as autograd
 from torch.autograd import Variable
 import os
 from utils import plotting
 import heapq
-
+import random
 USE_CUDA = torch.cuda.is_available()
 dtype = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
-
-
-class Variable(autograd.Variable):  # CUDA for GPU
-    def __init__(self, data, *args, **kwargs):
-        if USE_CUDA:
-            data = data.cuda()
-        super(Variable, self).__init__(data, *args, **kwargs)
 
 
 def preprocess_obs(obs):
@@ -32,6 +26,15 @@ def preprocess_obs(obs):
     return np.concatenate([image, direction])
 
 
+# def preprocess_obs(obs):
+#     image = torch.from_numpy(obs['image']).float().permute(2, 0, 1)  # (3, 7, 7)
+#     direction = F.one_hot(torch.tensor(obs['direction']), num_classes=4).float()  # (4,)
+#     # if device:
+#     #     image = image.to(device)
+#     #     direction = direction.to(device)
+#     return image, direction
+
+
 def one_hot_goal(goal, goal_space):
     vector = np.zeros(len(goal_space))
     goal_index = goal_space.index(goal)
@@ -45,105 +48,95 @@ def hdqn_learning(
     num_episodes,
     meta_schedule,
     ctrl_schedule,
-    gamma=1.0,
+    gamma_ctrl=0.99,
+    gamma_meta=1.0,
+    meta_update_freq=20,
+    ctrl_update_freq=2,
 ):
-
     results_dir = r"C:\Users\Ziyi Rao\pytorch-hdqn\results"  # File save path
     top_models = []
     os.makedirs(results_dir, exist_ok=True)
-
     stats = plotting.EpisodeStats(
         episode_lengths=np.zeros(num_episodes),
         episode_rewards=np.zeros(num_episodes)
     )
     total_timestep = 0
-    meta_timestep = 0
     ctrl_timestep = defaultdict(int)
-
     best_success_rate = 0.0
 
     for i_episode in range(num_episodes):
         obs,_ = env.reset()
         agent.reset_episode_flags()
         current_state = preprocess_obs(obs)
-
+        done = False
+        episode_success = False
         episode_length = 0
         episode_reward = 0
-        done = False
-
+        total_extrinsic_reward = 0
+        total_intrinsic_reward = 0
         while not done:
-            meta_timestep += 1
             meta_epsilon = meta_schedule.value(total_timestep)
             goal = agent.select_goal(current_state, meta_epsilon)
-            encoded_goal = one_hot_goal(goal, agent.possible_goals)
-            encoded_goal = encoded_goal.reshape(-1)
-
-            total_extrinsic_reward = 0
+            print(f"[META] Selected goal: {goal}")
+            encoded_goal = one_hot_goal(goal, agent.possible_goals).reshape(-1)
             goal_reached = False
+            goal_start_state = current_state.copy()
+            goal_extrinsic_reward = 0
 
             while not done and not goal_reached:
                 total_timestep += 1
                 episode_length += 1
                 ctrl_timestep[goal] += 1
-
                 ctrl_epsilon = ctrl_schedule.value(total_timestep)
                 joint_state_goal = np.concatenate([current_state, encoded_goal])
-                action = agent.select_action(joint_state_goal, ctrl_epsilon)[0]
-
+                action = agent.select_action(joint_state_goal, ctrl_epsilon)
                 next_obs, extrinsic_reward, terminated, truncated, info = env.step(action)
-
-                if hasattr(info, 'get') and isinstance(info, dict):
-                    episode_info = info.get('episode', {})
-                    extrinsic_reward = float(episode_info.get('r', extrinsic_reward))
-                else:
-                    extrinsic_reward = float(extrinsic_reward)
-
                 done = terminated or truncated
-
+                goal_extrinsic_reward += extrinsic_reward
                 next_state = preprocess_obs(next_obs)
-
-                intrinsic_reward = agent.get_intrinsic_reward(goal, next_obs)
                 goal_reached = agent.is_goal_reached(goal, next_obs)
-
+                intrinsic_reward = agent.get_intrinsic_reward(goal, next_obs)
                 joint_next_state_goal = np.concatenate([next_state, encoded_goal])
                 agent.ctrl_replay_memory.push(
                     joint_state_goal[np.newaxis, :],
                     action,
                     joint_next_state_goal[np.newaxis, :],
                     intrinsic_reward,
-                    done
+                    done or goal_reached
                 )
-
-                agent.update_meta_controller(gamma)
-                agent.update_controller(gamma)
+                if total_timestep % ctrl_update_freq == 0:
+                    agent.update_controller(gamma_ctrl)
 
                 total_extrinsic_reward += extrinsic_reward
-                episode_reward += extrinsic_reward
+                total_intrinsic_reward += intrinsic_reward
+                episode_reward += extrinsic_reward + intrinsic_reward
                 current_state = next_state
 
                 if goal_reached:
                     print(f"Goal {goal} reached! Terminating subtask.")
-                    break
-
-                if done:
-                    print(
-                        f"Episode done at total_timestep={total_timestep}, episode_length={episode_length}, info={info}")
+                if truncated:
+                    print("Episode ended due to time/step limit.")
 
             # After goal is completed or episode ends
-            agent.meta_replay_memory.push(
-                current_state, goal, next_state, total_extrinsic_reward, done
-            )
-        stats.episode_rewards[i_episode] += total_extrinsic_reward
+            # combined_reward = total_extrinsic_reward + total_intrinsic_reward
+            meta_reward = goal_extrinsic_reward
+            agent.meta_replay_memory.push(goal_start_state, goal, current_state, meta_reward, done)  # total reward
+            if total_timestep % meta_update_freq == 0:
+                agent.update_meta_controller(gamma_meta)
+            if goal == 3 and goal_reached:
+                episode_success = True
+        stats.episode_rewards[i_episode] += total_extrinsic_reward + total_intrinsic_reward
         stats.episode_lengths[i_episode] = episode_length
-
         print(f"Episode {i_episode + 1} finished:")
         print(f"  Length: {episode_length} steps")
-        print(f"  Total Reward: {episode_reward:.2f}")
-        print(f"Meta ε: {meta_epsilon:.3f}, Ctrl ε: {ctrl_epsilon:.3f}")
+        print(f"  Intrinsic Reward: {total_intrinsic_reward:.2f}")
+        print(f"  Meta Reward: {meta_reward:.2f}")
+        print(f"  Meta ε: {meta_epsilon:.3f}, Ctrl ε: {ctrl_epsilon:.3f}")
+        print(f"  Success: {episode_success}")
         print("-" * 40)
 
-        if (i_episode + 1) % 200 == 0:
-            test_epsilon = 0.0
+        if (i_episode + 1) % 200 == 0:  # Test evey 400 episodes
+            test_epsilon = 0.0  # Set exploration rate at 0
             test_stats = run_test_episodes(env, agent, num_episodes=50, epsilon=test_epsilon, render=False)
             current_success_rate = test_stats['success_rate']
 
@@ -181,11 +174,10 @@ def hdqn_learning(
             print(f"MetaController linear layers: {meta_layers}")
             print(f"Controller linear layers: {ctrl_layers}")
             print("-" * 40)
-
     return agent, stats
 
 
-def run_test_episodes(env, agent, num_episodes=100, epsilon=0.0, render=True):
+def run_test_episodes(env, agent, num_episodes=50, epsilon=0.0, render=True):
     agent.meta_controller.eval()
     agent.controller.eval()
     success_count = 0
@@ -198,7 +190,8 @@ def run_test_episodes(env, agent, num_episodes=100, epsilon=0.0, render=True):
 
         while not done:
             # 选择目标
-            goal = agent.select_goal(current_state, epsilon)
+            # goal = agent.select_goal(current_state, epsilon)
+            goal = agent.best_goal(current_state)
             encoded_goal = one_hot_goal(goal, agent.possible_goals).reshape(-1)
             goal_reached = False
 
@@ -222,9 +215,7 @@ def run_test_episodes(env, agent, num_episodes=100, epsilon=0.0, render=True):
 
         if success:
             success_count += 1
-            print(f"Test Episode {ep + 1}: Success=True!")
+            print(f"Test Episode {ep + 1}: Success!")
         else:
-            print(f"Test Episode {ep + 1}: Failed...")
-        if render:
-            env.render()
+            print(f"Test Episode {ep + 1}: Failed (Last goal: {goal}, Reached: {goal_reached})")
     return {"success_rate": success_count / num_episodes}
