@@ -1,28 +1,18 @@
-import numpy as np
+
 import random
 from collections import namedtuple
-
+from hdqn import preprocess_obs
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.autograd as autograd
-from minigrid.core.constants import COLOR_TO_IDX, OBJECT_TO_IDX
-from utils.replay_memory import ReplayMemory, Transition
+from utils.replay_memory import ReplayMemory
 
 USE_CUDA = torch.cuda.is_available()
-dtype = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
-
-GOAL_TYPE = OBJECT_TO_IDX["goal"]
-
-class Variable(autograd.Variable):
-    def __init__(self, data, *args, **kwargs):
-        if USE_CUDA:
-            data = data.cuda()
-        super(Variable, self).__init__(data, *args, **kwargs)
+device = torch.device("cuda" if USE_CUDA else "cpu")
 
 
 class MetaController(nn.Module):
-    def __init__(self, in_features=196, out_features=4):  # 方向编码4个
+    def __init__(self, in_features, out_features):
         super(MetaController, self).__init__()
         self.fc1 = nn.Linear(in_features, 512)
         self.ln1 = nn.LayerNorm(512)
@@ -30,12 +20,8 @@ class MetaController(nn.Module):
         self.ln2 = nn.LayerNorm(256)
         self.fc3 = nn.Linear(256, out_features)
 
-    # def forward(self, x):
-    #     x = F.relu(self.fc1(x))
-    #     x = F.relu(self.fc2(x))
-    #     return self.fc3(x)
-
     def forward(self, x):
+        x = x.float()
         x = F.leaky_relu(self.ln1(self.fc1(x)), 0.01)
         x = F.dropout(x, p=0.1, training=self.training)
         x = F.leaky_relu(self.ln2(self.fc2(x)), 0.01)
@@ -43,28 +29,70 @@ class MetaController(nn.Module):
         return x
 
 
+class MultiStrategyController(nn.Module):
+    def __init__(self, in_features, out_features, num_goals=4):
+        super().__init__()
+        self.num_goals = num_goals
+
+        # 共享特征提取
+        self.shared_net = nn.Sequential(
+            nn.Linear(in_features - num_goals, 256),
+            nn.LayerNorm(256),
+            nn.LeakyReLU(0.1, inplace=True)  # inplace节省内存
+        )
+
+        # self.strategy_heads = nn.ModuleDict({
+        #     '0': nn.Sequential(nn.Linear(256, 128), nn.Linear(128, out_features)),  # 接近钥匙策略
+        #     '1': nn.Sequential(nn.Linear(256, 128), nn.Linear(128, out_features)),  # 拿钥匙策略
+        #     '2': nn.Sequential(nn.Linear(256, 128), nn.Linear(128, out_features)),  # 开门策略
+        #     '3': nn.Sequential(nn.Linear(256, 128), nn.Linear(128, out_features))  # 导航策略
+        # })
+
+        # 并行策略头
+        self.strategy_heads = nn.ModuleList([  # 对应索引 0, 1, 2, 3
+            nn.Sequential(
+                nn.Linear(256, 128),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, out_features)
+            ) for _ in range(num_goals)
+        ])
+
+        # 预分配缓冲区
+        self.register_buffer('_goal_mask', torch.zeros(1, dtype=torch.bool))
+
+    def forward(self, x):
+        x = x.float()
+        batch_size = x.size(0)
+        state = x[:, :-self.num_goals]
+        goal = x[:, -self.num_goals:]
+
+        # 并行计算所有策略头
+        shared_features = self.shared_net(state)  # [B, 256]
+        all_outputs = torch.stack([head(shared_features) for head in self.strategy_heads],
+                                  dim=1)  # [B, num_goals, out_features]
+
+        # 向量化选择 (替代循环)
+        goal_idx = torch.argmax(goal, dim=1)  # [B]
+        return all_outputs[torch.arange(batch_size), goal_idx]  # [B, out_features]
 
 
 class Controller(nn.Module):
-    def __init__(self, in_features=200, out_features=7):  # 输入：网格192+方向4+子目标4   输出：7个可能动作
-        super(Controller, self).__init__()
-        self.fc1 = nn.Linear(in_features,512)
-        self.ln1 = nn.LayerNorm(512)
-        self.fc2 = nn.Linear(512, 256)
-        self.ln2 = nn.LayerNorm(256)
-        self.fc3 = nn.Linear(256, out_features)
-
-    # def forward(self, x):
-    #     x = F.relu(self.fc1(x))
-    #     x = F.relu(self.fc2(x))
-    #     return self.fc3(x)
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features, 512),
+            nn.LayerNorm(512),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.LeakyReLU(0.1),
+            nn.Linear(256, out_features)
+        )
 
     def forward(self, x):
-        x = F.leaky_relu(self.ln1(self.fc1(x)), 0.01)
-        x = F.dropout(x, p=0.1, training=self.training)
-        x = F.leaky_relu(self.ln2(self.fc2(x)), 0.01)
-        x = self.fc3(x)
-        return x
+        return self.net(x.float())
+
 
 """
     OptimizerSpec containing following attributes
@@ -73,39 +101,119 @@ class Controller(nn.Module):
 """
 OptimizerSpec = namedtuple("OptimizerSpec", ["constructor", "kwargs"])
 
+
 class hDQN():
     def __init__(self,
                  env,
                  optimizer_spec,
                  num_goal=4,
                  num_action=7,
-                 replay_memory_size=20000,
+                 replay_memory_size=20_000,
                  batch_size=128):
-        ###############
-        # BUILD MODEL #
-        ###############
         self.env = env
         self.num_goal = num_goal
         self.num_action = num_action
         self.batch_size = batch_size
-        # Construct meta-controller and controller
-        controller_input_dim = 192 + num_goal + 4  #(75+4 direction)
-        meta_input_dim = 192 + 4   # meta-controller 只看环境状态
-
-        self.meta_controller = MetaController(in_features=meta_input_dim, out_features=num_goal).type(dtype)
-        self.target_meta_controller = MetaController(in_features=meta_input_dim, out_features=num_goal).type(dtype)
-        self.controller = Controller(in_features=controller_input_dim, out_features=num_action).type(dtype)
-        self.target_controller = Controller(in_features=controller_input_dim, out_features=num_action).type(dtype)
-        # Construct the optimizers for meta-controller and controller
+        sample_obs, _ = env.reset()
+        processed_obs = preprocess_obs(sample_obs)
+        self.state_dim = len(processed_obs)
+        self.controller_input_dim = self.state_dim + num_goal
+        # self.meta_controller = MetaController(in_features=self.state_dim, out_features=num_goal).to(device)
+        # self.controller = Controller(in_features=self.controller_input_dim, out_features=num_action).to(device)
+        # self.target_meta_controller = MetaController(in_features=self.state_dim, out_features=num_goal).to(device)
+        # self.target_controller = Controller(in_features=self.controller_input_dim, out_features=num_action).to(device)
+        self.meta_controller = MetaController(in_features=self.state_dim, out_features=num_goal)
+        self.controller = Controller(in_features=self.controller_input_dim, out_features=num_action)
+        self.target_meta_controller = MetaController(in_features=self.state_dim, out_features=num_goal)
+        self.target_controller = Controller(in_features=self.controller_input_dim, out_features=num_action)
+        # self.controller = MultiStrategyController(in_features=self.controller_input_dim, out_features=num_action)
+        # self.target_controller = MultiStrategyController(in_features=self.controller_input_dim, out_features=num_action)
         self.meta_optimizer = optimizer_spec.constructor(self.meta_controller.parameters(), **optimizer_spec.kwargs)
         self.ctrl_optimizer = optimizer_spec.constructor(self.controller.parameters(), **optimizer_spec.kwargs)
-        # Construct the replay memory for meta-controller and controller
         self.meta_replay_memory = ReplayMemory(replay_memory_size)
         self.ctrl_replay_memory = ReplayMemory(replay_memory_size)
-
-        self.controller_update_steps = 0
         self.completed_goals = set()
         self.possible_goals = [0, 1, 2, 3]
+        self.tau = 0.01
+        self._goal_checkers = {
+            0: self._goal_0,
+            1: self._goal_1,
+            2: self._goal_2,
+            3: self._goal_3
+        }
+
+    def _goal_0(self, obs):  # 靠近钥匙
+        agent_pos = self.get_agent_position()
+        carrying = self.env.unwrapped.carrying
+        grid = self.env.unwrapped.grid
+        result = ((not carrying) and any(obj.type == 'key' for obj in grid.grid if obj)
+                  and self.near_key(agent_pos, obs))
+        if result:
+            self.completed_goals.add(0)
+        return result
+
+    def _goal_1(self, obs):  # 捡起钥匙
+        carrying = self.env.unwrapped.carrying
+        result = carrying is not None and carrying.type == 'key'
+        if result:
+            self.completed_goals.add(1)
+        return result
+
+    def _goal_2(self, obs):  # 开门
+        door = next((obj for obj in self.env.unwrapped.grid.grid if obj and obj.type == 'door'), None)
+        return door.is_open if door else False
+
+    def _goal_3(self, obs):  # 到达终点
+        agent_pos = self.get_agent_position()
+        cell = self.env.unwrapped.grid.get(agent_pos[0], agent_pos[1])
+        return cell is not None and cell.type == 'goal'
+
+    def select_goal(self, state, epsilon):
+        sample = random.random()
+        if sample > epsilon:
+            # 利用策略
+            state = torch.from_numpy(state).to(device)
+            with torch.no_grad():
+                q_values = self.meta_controller(state.unsqueeze(0))[0]
+            return q_values.argmax().item()
+        else:
+            # 探索策略
+            return random.randint(0, self.num_goal - 1)
+
+    def best_goal(self, state):
+        """
+        用于测试：选择 Q 值最高的目标（不考虑逻辑可达性）
+        """
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+        with torch.no_grad():
+            q_values = self.meta_controller(state_tensor)[0]
+        return int(torch.argmax(q_values).item())
+
+    def select_action(self, joint_state_goal, epsilon):
+        valid_actions = [0, 1, 2, 3, 5]
+        if random.random() < epsilon:
+            return random.choice(valid_actions)
+        # 获取 Q 值，并屏蔽无效动作
+        q_values = self.controller(
+            torch.tensor(joint_state_goal, dtype=torch.float32, device=device).unsqueeze(0)
+        )[0]
+        q_values[[4, 6]] = float('-inf')  # 将无效动作的 Q 值设为一个很小的数，让它不可能被选中
+        return q_values.argmax().item()
+
+    def best_action(self, joint_state_goal):
+        """测试专用：带Q值标准化和屏蔽的贪婪策略"""
+        q_values = self._compute_q_values(joint_state_goal)
+        # 标准化 Q 值（视训练稳定性决定是否需要）
+        q_values = (q_values - q_values.mean()) / (q_values.std() + 1e-6)
+        q_values[0, [4, 6]] = -float('inf')  # 屏蔽无效动作
+        return q_values.argmax().item()
+
+    # ===== 以下是辅助方法 =====
+    def _compute_q_values(self, joint_state_goal):
+        """封装Q值计算逻辑"""
+        with torch.no_grad():
+            state_tensor = torch.from_numpy(joint_state_goal).float().to(device).unsqueeze(0)
+            return self.controller(state_tensor)
 
     def get_agent_position(self):
         return self.env.unwrapped.agent_pos
@@ -135,89 +243,46 @@ class hDQN():
         cell = self.env.unwrapped.grid.get(x, y)
         return cell is not None and cell.type == 'goal'
 
-    def get_intrinsic_reward(self, goal, obs):
-        if goal == 3 and self.is_goal_reached(goal, obs):
-            return 1.0
-        # elif self.is_goal_reached(goal, obs):
-        #     return 0.2
-        return 0.0
-
     def reset_episode_flags(self):
         self.completed_goals = set()  # 每轮Episode开始时重置
 
-    def select_goal(self, state, epsilon):
-        sample = random.random()
-        carrying = self.env.unwrapped.carrying
-        door_open = any(obj.is_open for obj in self.env.unwrapped.grid.grid if obj and obj.type == 'door')
-
-        # 动态生成可行目标列表（排除已完成的子目标）
-        active_goals = []
-        if door_open:
-            active_goals = [3]
-        elif carrying and carrying.type == 'key':
-            active_goals = [2]
-        elif any(obj.type == 'key' for obj in self.env.unwrapped.grid.grid if obj):
-            possible_goals = [0, 1]
-            active_goals = [g for g in possible_goals if g not in self.completed_goals]  # 关键修改
-        else:
-            active_goals = []
-
-        if sample > epsilon:
-            # 利用阶段：从active_goals中选择Q值最高的目标
-            state = torch.from_numpy(state).type(dtype)
-            with torch.no_grad():
-                q_values = self.meta_controller(state.unsqueeze(0))
-                if not active_goals:
-                    return 3
-                possible_q_values = q_values[0][active_goals]
-                best_idx = torch.argmax(possible_q_values).item()
-                return active_goals[best_idx]
-        else:
-            # 探索阶段：直接排除已完成的子目标
-            return random.choice(active_goals) if active_goals else 3
-
-    def select_action(self, joint_state_goal, epsilon):
-        sample = random.random()
-        if sample > epsilon:
-            joint_state_goal = torch.from_numpy(joint_state_goal).type(dtype)
-            with torch.no_grad():
-                q_values = self.controller(joint_state_goal.unsqueeze(0))
-                action = q_values.max(1)[1].cpu()
-            return action
-        else:
-            return torch.IntTensor([random.randrange(self.num_action)])
-
-    def best_action(self, joint_state_goal):  # 测试时用
-        joint_state_goal = torch.from_numpy(joint_state_goal).type(dtype)
-        with torch.no_grad():
-            q_values = self.controller(joint_state_goal.unsqueeze(0))
-            action = q_values.argmax(1).item()
-        return action
-
+    def get_intrinsic_reward(self, goal, obs):
+        if goal == 3 and self.is_goal_reached(goal, obs):
+            return 1.0
+        elif self.is_goal_reached(goal, obs):
+            return 1.0
+        return 0.0
 
     def is_goal_reached(self, goal, obs):
-        agent_pos = self.get_agent_position()
-        carrying = self.env.unwrapped.carrying
-        grid = self.env.unwrapped.grid
+        return self._goal_checkers.get(goal, lambda obs: False)(obs)
 
-        if goal == 0:
-            result = (not carrying) and any(obj.type == 'key' for obj in grid.grid if obj) and self.near_key(agent_pos,
-                                                                                                             obs)
-            if result:
-                self.completed_goals.add(0)  # 标记Goal 0已完成
-            return result
-        elif goal == 1:
-            result = carrying is not None and carrying.type == 'key'
-            if result:
-                self.completed_goals.add(1)  # 标记Goal 1已完成
-            return result
-        elif goal == 2:  # 门已打开
-            door = next((obj for obj in grid.grid if obj and obj.type == 'door'), None)
-            return door.is_open if door else False
-        elif goal == 3:  # 到达终点
-            cell = grid.get(agent_pos[0], agent_pos[1])
-            return cell is not None and cell.type == 'goal'
-        return False
+    # def is_goal_reached(self, goal, obs):
+    #     agent_pos = self.get_agent_position()
+    #     carrying = self.env.unwrapped.carrying
+    #     grid = self.env.unwrapped.grid
+    #     if goal == 0:
+    #         result = ((not carrying) and any(obj.type == 'key' for obj in grid.grid if obj)
+    #                   and self.near_key(agent_pos,obs))
+    #         if result:
+    #             self.completed_goals.add(0)  # 标记Goal 0已完成
+    #         return result
+    #     elif goal == 1:
+    #         result = carrying is not None and carrying.type == 'key'
+    #         if result:
+    #             self.completed_goals.add(1)  # 标记Goal 1已完成
+    #         return result
+    #     elif goal == 2:  # 门已打开
+    #         door = next((obj for obj in grid.grid if obj and obj.type == 'door'), None)
+    #         return door.is_open if door else False
+    #     elif goal == 3:  # 到达终点
+    #         cell = grid.get(agent_pos[0], agent_pos[1])
+    #         return cell is not None and cell.type == 'goal'
+    #     return False
+
+    @ staticmethod
+    def soft_update(target_net, source_net, tau=0.01):
+        for target_param, param in zip(target_net.parameters(), source_net.parameters()):
+            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
     def update_meta_controller(self, gamma=1.0):
         if len(self.meta_replay_memory) < self.batch_size:
@@ -225,23 +290,20 @@ class hDQN():
         state_batch, goal_batch, next_state_batch, ex_reward_batch, done_mask = \
             self.meta_replay_memory.sample(self.batch_size)
 
-        state_batch = Variable(torch.from_numpy(state_batch).type(dtype))
-        goal_batch = Variable(torch.from_numpy(goal_batch).long())
-        next_state_batch = Variable(torch.from_numpy(next_state_batch).type(dtype))
-        ex_reward_batch = Variable(torch.from_numpy(ex_reward_batch).type(dtype))
-        not_done_mask = Variable(torch.from_numpy(1 - done_mask)).type(dtype)
-        if USE_CUDA:
-            goal_batch = goal_batch.cuda()
-        # Compute current Q value, meta_controller takes only state and output value for every state-goal pair
-        # We choose Q based on goal chosen.
-
-        # reshape state_batch 变成 (batch_size, feature_dim)
-        # feature_dim 就是 fc1 的输入维度，比如 79
+        # state_batch = torch.from_numpy(state_batch).to(device)
+        # goal_batch = torch.from_numpy(goal_batch).long()
+        # next_state_batch = torch.from_numpy(next_state_batch).to(device)
+        # ex_reward_batch = torch.from_numpy(ex_reward_batch).to(device)
+        # not_done_mask = torch.from_numpy(1 - done_mask).to(device)
+        # goal_batch = goal_batch.to(device)
+        state_batch = torch.from_numpy(state_batch)
+        goal_batch = torch.from_numpy(goal_batch).long()
+        next_state_batch = torch.from_numpy(next_state_batch)
+        ex_reward_batch = torch.from_numpy(ex_reward_batch)
+        not_done_mask = torch.from_numpy(1 - done_mask)
+        goal_batch = goal_batch
         state_batch = state_batch.view(-1, self.meta_controller.fc1.in_features)
         next_state_batch = next_state_batch.view(-1, self.meta_controller.fc1.in_features)
-
-        # print("state_batch.shape:", state_batch.shape)
-        # print("meta_controller fc1 in_features:", self.meta_controller.fc1.in_features)
         current_Q_values = self.meta_controller(state_batch).gather(1, goal_batch.unsqueeze(1))
         # Compute next Q value based on which goal gives max Q values
         # Detach variable from the current graph since we don't want gradients for next Q to propagated
@@ -250,31 +312,29 @@ class hDQN():
         # Compute the target of the current Q values
         target_Q_values = ex_reward_batch + (gamma * next_Q_values)
         # Compute Bellman error (using Huber loss)
-        # loss = F.smooth_l1_loss(current_Q_values, target_Q_values)
         loss = F.smooth_l1_loss(current_Q_values, target_Q_values.unsqueeze(1))
 
         # Copy Q to target Q before updating parameters of Q
-        self.target_meta_controller.load_state_dict(self.meta_controller.state_dict())
+        # self.target_meta_controller.load_state_dict(self.meta_controller.state_dict())
         # Optimize the model
         self.meta_optimizer.zero_grad()
         loss.backward()
         for param in self.meta_controller.parameters():
             param.grad.data.clamp_(-1, 1)
         self.meta_optimizer.step()
+        self.soft_update(self.target_meta_controller, self.meta_controller, self.tau)
 
     def update_controller(self, gamma=1.0):
         if len(self.ctrl_replay_memory) < self.batch_size:
             return
         state_goal_batch, action_batch, next_state_goal_batch, in_reward_batch, done_mask = \
             self.ctrl_replay_memory.sample(self.batch_size)
-        # print("state_goal_batch shape:", state_goal_batch.shape)
-        state_goal_batch = Variable(torch.from_numpy(state_goal_batch).type(dtype))
-        action_batch = Variable(torch.from_numpy(action_batch).long())
-        next_state_goal_batch = Variable(torch.from_numpy(next_state_goal_batch).type(dtype))
-        in_reward_batch = Variable(torch.from_numpy(in_reward_batch).type(dtype))
-        not_done_mask = Variable(torch.from_numpy(1 - done_mask)).type(dtype)
-        if USE_CUDA:
-            action_batch = action_batch.cuda()
+        state_goal_batch = torch.from_numpy(state_goal_batch).to(device)
+        action_batch = torch.from_numpy(action_batch).long()
+        next_state_goal_batch = torch.from_numpy(next_state_goal_batch).to(device)
+        in_reward_batch = torch.from_numpy(in_reward_batch).to(device)
+        not_done_mask = torch.from_numpy(1 - done_mask).to(device)
+        action_batch = action_batch.to(device)
         # Compute current Q value, controller takes only (state, goal) and output value for every (state, goal)-action pair
         # We choose Q based on action taken.
         current_Q_values = self.controller(state_goal_batch).gather(1, action_batch.unsqueeze(1))
@@ -289,14 +349,12 @@ class hDQN():
         loss = F.smooth_l1_loss(current_Q_values, target_Q_values)
 
         # Copy Q to target Q before updating parameters of Q
-        self.target_controller.load_state_dict(self.controller.state_dict())
+        # self.target_controller.load_state_dict(self.controller.state_dict())
         # Optimize the model
         self.ctrl_optimizer.zero_grad()
         loss.backward()
         for param in self.controller.parameters():
-            param.grad.data.clamp_(-1, 1)
+            if param.grad is not None:
+                param.grad.data.clamp_(-1, 1)
         self.ctrl_optimizer.step()
-
-        # self.controller_update_steps += 1
-        # if self.controller_update_steps % 100 == 0:
-        #     print(f"[Update {self.controller_update_steps}] Controller loss: {loss.item():.4f}")
+        self.soft_update(self.target_controller, self.controller, self.tau)
