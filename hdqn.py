@@ -1,7 +1,6 @@
 import numpy as np
 from collections import defaultdict
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.autograd as autograd
 from torch.autograd import Variable
@@ -49,7 +48,7 @@ def hdqn_learning(
     meta_schedule,
     ctrl_schedule,
     gamma_ctrl=0.99,
-    gamma_meta=1.0,
+    gamma_meta=0.99,
     meta_update_freq=20,
     ctrl_update_freq=2,
 ):
@@ -68,11 +67,12 @@ def hdqn_learning(
         obs,_ = env.reset()
         agent.reset_episode_flags()
         current_state = preprocess_obs(obs)
+        episode_transitions = []
         done = False
         episode_success = False
         episode_length = 0
         episode_reward = 0
-        total_extrinsic_reward = 0
+        total_meta_reward = 0
         total_intrinsic_reward = 0
         while not done:
             meta_epsilon = meta_schedule.value(total_timestep)
@@ -81,8 +81,6 @@ def hdqn_learning(
             encoded_goal = one_hot_goal(goal, agent.possible_goals).reshape(-1)
             goal_reached = False
             goal_start_state = current_state.copy()
-            goal_extrinsic_reward = 0
-
             while not done and not goal_reached:
                 total_timestep += 1
                 episode_length += 1
@@ -92,23 +90,23 @@ def hdqn_learning(
                 action = agent.select_action(joint_state_goal, ctrl_epsilon)
                 next_obs, extrinsic_reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
-                goal_extrinsic_reward += extrinsic_reward
                 next_state = preprocess_obs(next_obs)
                 goal_reached = agent.is_goal_reached(goal, next_obs)
                 intrinsic_reward = agent.get_intrinsic_reward(goal, next_obs)
+                total_intrinsic_reward += intrinsic_reward
                 joint_next_state_goal = np.concatenate([next_state, encoded_goal])
-                agent.ctrl_replay_memory.push(
+                transition = (
                     joint_state_goal[np.newaxis, :],
                     action,
                     joint_next_state_goal[np.newaxis, :],
                     intrinsic_reward,
                     done or goal_reached
                 )
+                agent.ctrl_replay_memory.push(*transition)
+                episode_transitions.append(transition)
                 if total_timestep % ctrl_update_freq == 0:
                     agent.update_controller(gamma_ctrl)
-
-                total_extrinsic_reward += extrinsic_reward
-                total_intrinsic_reward += intrinsic_reward
+                # total_extrinsic_reward += extrinsic_reward
                 episode_reward += extrinsic_reward + intrinsic_reward
                 current_state = next_state
 
@@ -117,25 +115,35 @@ def hdqn_learning(
                 if truncated:
                     print("Episode ended due to time/step limit.")
 
-            # After goal is completed or episode ends
+            # if goal_reached:
+            #     recent_steps = episode_transitions
+            #     for t in recent_steps:
+            #         agent.ctrl_success_memory.push(*t)
+            #     # 同时多训练几次 controller
+            #     for _ in range(5):
+            #         agent.update_controller(gamma_ctrl)
+            meta_reward = agent.get_meta_reward(goal, goal_reached)
+            agent.meta_replay_memory.push(goal_start_state, goal, current_state, meta_reward, done)
+            if goal == 2 and goal_reached:
+                episode_success = True
+            total_meta_reward += meta_reward
             # combined_reward = total_extrinsic_reward + total_intrinsic_reward
-            meta_reward = goal_extrinsic_reward
-            agent.meta_replay_memory.push(goal_start_state, goal, current_state, meta_reward, done)  # total reward
+
+            # if goal == 3 and goal_reached:
+            #     agent.meta_success_memory.push(goal_start_state, goal, current_state, meta_reward, done)
             if total_timestep % meta_update_freq == 0:
                 agent.update_meta_controller(gamma_meta)
-            if goal == 3 and goal_reached:
-                episode_success = True
-        stats.episode_rewards[i_episode] += total_extrinsic_reward + total_intrinsic_reward
+        # stats.episode_rewards[i_episode] += total_extrinsic_reward + total_intrinsic_reward
         stats.episode_lengths[i_episode] = episode_length
         print(f"Episode {i_episode + 1} finished:")
         print(f"  Length: {episode_length} steps")
         print(f"  Intrinsic Reward: {total_intrinsic_reward:.2f}")
-        print(f"  Meta Reward: {meta_reward:.2f}")
+        print(f"  Total Meta Reward: {total_meta_reward:.2f}")
         print(f"  Meta ε: {meta_epsilon:.3f}, Ctrl ε: {ctrl_epsilon:.3f}")
         print(f"  Success: {episode_success}")
         print("-" * 40)
 
-        if (i_episode + 1) % 200 == 0:  # Test evey 400 episodes
+        if (i_episode + 1) % 200 == 0:  # Test evey 200 episodes
             test_epsilon = 0.0  # Set exploration rate at 0
             test_stats = run_test_episodes(env, agent, num_episodes=50, epsilon=test_epsilon, render=False)
             current_success_rate = test_stats['success_rate']
@@ -165,14 +173,6 @@ def hdqn_learning(
                     if os.path.exists(worst_model[1]):
                         os.remove(worst_model[1])
                         print(f"Deleted old model: {worst_model[1]}")
-
-            def count_layers(model):
-                return sum(1 for _ in model.modules() if isinstance(_, nn.Linear))
-
-            meta_layers = count_layers(agent.meta_controller)
-            ctrl_layers = count_layers(agent.controller)
-            print(f"MetaController linear layers: {meta_layers}")
-            print(f"Controller linear layers: {ctrl_layers}")
             print("-" * 40)
     return agent, stats
 
@@ -190,8 +190,8 @@ def run_test_episodes(env, agent, num_episodes=50, epsilon=0.0, render=True):
 
         while not done:
             # 选择目标
-            # goal = agent.select_goal(current_state, epsilon)
-            goal = agent.best_goal(current_state)
+            goal = agent.select_goal(current_state, epsilon)
+            # goal = agent.best_goal(current_state)
             encoded_goal = one_hot_goal(goal, agent.possible_goals).reshape(-1)
             goal_reached = False
 
@@ -199,15 +199,13 @@ def run_test_episodes(env, agent, num_episodes=50, epsilon=0.0, render=True):
                 # 选择动作
                 joint_state_goal = np.concatenate([current_state, encoded_goal])
                 action = agent.best_action(joint_state_goal)
-
                 # 执行动作
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 current_state = preprocess_obs(next_obs)
-
                 # 检查目标达成
                 goal_reached = agent.is_goal_reached(goal, next_obs)
-                if goal == 3 and goal_reached:
+                if goal == 2 and goal_reached:
                     success = True
 
                 if done:
